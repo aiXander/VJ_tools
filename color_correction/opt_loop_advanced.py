@@ -43,10 +43,13 @@ class SpatialWarp:
 # -------------------------------------------------------------------------
 # New Class: SimulatedCamera ----------------------------------------------
 class SimulatedCamera:
-    """Simulates a camera with a fixed, random initial misalignment."""
-    def __init__(self, max_rotation, max_shift, width, height, center_xy):
+    """Simulates a camera capturing a projection, including fixed misalignment."""
+    def __init__(self, surf, ambient_light_strength, max_rotation, max_shift, width, height, center_xy):
         self.W, self.H = width, height
         self.img_center = center_xy
+        # --- Internal simulator for ideal perception ---
+        self.simulator = ProjectionSimulator(surf, ambient_light_strength)
+
         # --- Simulate initial misalignment (Calculated ONCE) ---
         misalign_theta = random.uniform(-max_rotation, max_rotation)
         misalign_tx    = random.uniform(-max_shift, max_shift) * self.W
@@ -56,8 +59,11 @@ class SimulatedCamera:
         )
         print(f"Simulated Camera Misalignment: θ={misalign_theta:.2f}°, tx={misalign_tx:.1f}px, ty={misalign_ty:.1f}px")
 
-    def capture(self, ideal_perceived_image):
-        """Applies the fixed misalignment warp to the ideal perceived image."""
+    def capture(self, beamer_map):
+        """Simulates projection and captures with fixed misalignment."""
+        # 1. Calculate the ideal perceived image
+        ideal_perceived_image = self.simulator.calculate_perceived(beamer_map)
+        # 2. Apply the fixed misalignment warp
         return cv2.warpAffine(
             ideal_perceived_image, self.M_misalign, (self.W, self.H),
             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0)
@@ -119,17 +125,14 @@ def main(surface_path, target_path):
 
     # Beamer layer (starts with initial value, optimized in phase 2)
     beamer = BeamerOutLayer((H, W, 3))
-    # Simulator (doesn't hold beamer state anymore)
-    sim    = ProjectionSimulator(surf, AMBIENT_LIGHT_STRENGTH)
-    # Simulated Camera with fixed misalignment
-    camera = SimulatedCamera(MAX_ROTATION, MAX_SHIFT, W, H, img_center)
+    # Simulated Camera with fixed misalignment and internal projection simulator
+    camera = SimulatedCamera(surf, AMBIENT_LIGHT_STRENGTH, MAX_ROTATION, MAX_SHIFT, W, H, img_center)
 
     # Load target, resize, convert to float32 [0, 1]
-    target_bgr_u8 = cv2.imread(target_path)
-    target_bgr_f32 = cv2.resize(target_bgr_u8, (W, H)).astype(np.float32) / 255.0
+    target_bgr_f32 = cv2.resize(cv2.imread(target_path), (W, H)).astype(np.float32) / 255.0
 
     lossfn = Loss(target_bgr_f32)
-    beamer_opt = AdamOptimiser(BEAMER_LEARNING_RATE, (H, W, 3))
+    color_opt = AdamOptimiser(BEAMER_LEARNING_RATE, (H, W, 3))
     warp_opt   = AdamOptimiser(WARP_LEARNING_RATE, (3,)) # Optimizer for theta, tx, ty
     spatial_warp = SpatialWarp() # Holds the optimizable warp parameters
 
@@ -165,13 +168,10 @@ def main(surface_path, target_path):
             current_warp_params = spatial_warp.get_params() # Fixed (though read for info)
 
         # --- Forward Pass ---
-        # 1. Render ideal perceived image based on current beamer map
-        ideal_perceived = sim.calculate_perceived(current_beamer_map)
+        # 1. Simulate camera capture (includes projection and misalignment)
+        misaligned_perceived = camera.capture(current_beamer_map) # Takes beamer map
 
-        # 2. Simulate camera capture (applies fixed misalignment)
-        misaligned_perceived = camera.capture(ideal_perceived) # Use camera class
-
-        # 3. Apply corrective warp (Optimizable in P1, Fixed in P2)
+        # 2. Apply corrective warp (Optimizable in P1, Fixed in P2)
         corrected_perceived = cv2.warpAffine(misaligned_perceived, M_corrective, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE) # Use replicate border for correction
 
         # --- Compute Loss ---
@@ -197,7 +197,7 @@ def main(surface_path, target_path):
                 current_phase = 2
                 # Reset beamer map to initial value and reset its optimizer
                 beamer.reset()
-                beamer_opt.reset()
+                color_opt.reset()
                 print("--- Starting Phase 2: Color Optimization ---\n")
 
 
@@ -211,7 +211,7 @@ def main(surface_path, target_path):
             grad_bmr = (grad_corrected_perceived * surf * beamer_clip_mask).astype(np.float32)
 
             # Update Beamer
-            beamer.update(beamer_opt.step(grad_bmr, current_beamer_map))
+            beamer.update(color_opt.step(grad_bmr, current_beamer_map))
 
         last_corrected_perceived = corrected_perceived # Store for final image
 
@@ -269,8 +269,8 @@ def main(surface_path, target_path):
         # Generate default perceived view (using target *as* beamer output for comparison)
         # Apply the original misalignment to simulate the "uncorrected" view
         default_beamer_out = target_bgr_f32 # Projecting the target directly
-        default_ideal_perceived = sim.calculate_perceived(default_beamer_out)
-        default_misaligned_perceived = camera.capture(default_ideal_perceived) # Use camera capture
+        # Use the camera simulation directly
+        default_misaligned_perceived = camera.capture(default_beamer_out)
 
         # Get final beamer output (state after phase 2)
         final_beamer_map = beamer.get()

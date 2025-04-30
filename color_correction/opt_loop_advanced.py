@@ -101,8 +101,8 @@ def main(surface_path, target_path):
     initial_sigma_tx = MAX_SHIFT * W / 2.0
     initial_sigma_ty = MAX_SHIFT * H / 2.0
     # Use a single sigma value, CMA-ES adapts per-parameter variances internally
-    initial_sigma0 = np.mean([initial_sigma_theta, initial_sigma_tx, initial_sigma_ty]) * 0.5 # Start with moderate overall variance
-    CMAES_POPULATION_SIZE = 25 # Define population size
+    initial_sigma0 = np.mean([initial_sigma_theta, initial_sigma_tx, initial_sigma_ty]) # Increase initial variance
+    CMAES_POPULATION_SIZE = 50 # Increase population size
     # Define bounds loosely based on config, can be tuned
     warp_bounds = [
         [-MAX_ROTATION * 1.5, -MAX_SHIFT * W * 0.8, -MAX_SHIFT * H * 0.8], # Lower bounds [theta, tx, ty]

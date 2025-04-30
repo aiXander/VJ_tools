@@ -339,8 +339,8 @@ def main(surface_path, target = None):
 
 
 if __name__ == "__main__":
-    surface_path = 'surface.jpg'
-    target = 'target.jpg'
+    surface_path = '../assets/surface.jpg'
+    target = '../assets/target.jpg'
     #target = 0.5 # Example: use a uniform target value
 
     main(surface_path, target=target)

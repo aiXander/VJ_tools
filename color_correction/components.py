@@ -118,7 +118,6 @@ class ProjectionSimulator:
 class Loss:
     def __init__(self, target_rgb_f32):
         self.target_rgb = target_rgb_f32.astype(np.float32)
-        self.target_lab = rgb_to_lab(self.target_rgb)
         self.target_gray = cv2.cvtColor(self.target_rgb, cv2.COLOR_BGR2GRAY)
 
     def compute_rgb_loss(self, perceived_rgb_f32):
@@ -130,9 +129,9 @@ class Loss:
     def compute_rgb_gradient_wrt_input(self, perceived_rgb_f32):
         """Calculates the analytical gradient of RGB MSE loss w.r.t perceived_rgb."""
         diff_rgb = perceived_rgb_f32 - self.target_rgb
-        N = perceived_rgb_f32.size # Total number of elements H*W*3
-        grad_perceived_rgb = 2.0 * diff_rgb / N
-        return grad_perceived_rgb
+        N = perceived_rgb_f32.size # Total number of elements H*W*3 
+        grad_rgb = 2.0 * diff_rgb / N
+        return grad_rgb
 
     def compute_loss_components(self, perceived_rgb_f32):
         """Computes loss value(s) based on the input perceived image."""
@@ -141,8 +140,7 @@ class Loss:
         if config.RGB_LOSS_W > 0:
             rgb_L = self.compute_rgb_loss(perceived_rgb_f32)
 
-        ssim_L = 0.0 # No SSIM calculation yet
-        # TODO: Implement SSIM calculation if SSIM_LOSS_W > 0
+        ssim_L = 0.0
 
         total_L = config.RGB_LOSS_W * rgb_L + config.SSIM_LOSS_W * ssim_L
-        return total_L, rgb_L, ssim_L 
+        return total_L, rgb_L, ssim_L

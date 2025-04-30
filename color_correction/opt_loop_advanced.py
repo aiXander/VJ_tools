@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import random
 import cma
+import math
 
 # Import constants and components from separate files
 from config import *
@@ -47,30 +48,64 @@ class SpatialWarp:
 # New Class: SimulatedCamera ----------------------------------------------
 class SimulatedCamera:
     """Simulates a camera capturing a projection, including fixed misalignment."""
-    def __init__(self, surf, ambient_light_strength, max_rotation, max_shift, width, height, center_xy):
+    def __init__(self, surf, ambient_light_strength, max_rotation, max_shift_factor, width, height, center_xy):
         self.W, self.H = width, height
         self.img_center = center_xy
+        self.max_shift_factor = max_shift_factor # Store max_shift
+
+        # Calculate padding needed to avoid black borders after warp
+        # Use ceil for safety and a factor of 1.5 for rotation margin
+        self.pad_x = math.ceil(self.W * self.max_shift_factor * 1.5)
+        self.pad_y = math.ceil(self.H * self.max_shift_factor * 1.5)
+
         # --- Internal simulator for ideal perception ---
         self.simulator = ProjectionSimulator(surf, ambient_light_strength)
 
-        # --- Simulate initial misalignment (Calculated ONCE) ---
+        # --- Simulate initial misalignment (Calculated ONCE using original center) ---
         misalign_theta = random.uniform(-max_rotation, max_rotation)
-        misalign_tx    = random.uniform(-max_shift, max_shift) * self.W
-        misalign_ty    = random.uniform(-max_shift, max_shift) * self.H
+        misalign_tx    = random.uniform(-max_shift_factor, max_shift_factor) * self.W
+        misalign_ty    = random.uniform(-max_shift_factor, max_shift_factor) * self.H
+        # M_misalign is calculated based on the *original* image center
         self.M_misalign = SpatialWarp.get_matrix_from_params(
             misalign_theta, misalign_tx, misalign_ty, self.img_center
         )
         print(f"Simulated Camera Misalignment: θ={misalign_theta:.2f}°, tx={misalign_tx:.1f}px, ty={misalign_ty:.1f}px")
+        print(f"Calculated Padding: pad_x={self.pad_x}px, pad_y={self.pad_y}px")
 
     def capture(self, beamer_map):
-        """Simulates projection and captures with fixed misalignment."""
+        """Simulates projection, pads, warps on larger canvas, and crops."""
         # 1. Calculate the ideal perceived image
-        ideal_perceived_image = self.simulator.calculate_perceived(beamer_map)
-        # 2. Apply the fixed misalignment warp
-        return cv2.warpAffine(
-            ideal_perceived_image, self.M_misalign, (self.W, self.H),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0)
+        ideal_perceived_image = self.simulator.calculate_perceived(beamer_map) # Shape (H, W, 3)
+
+        # 2. Pad the ideal image
+        padded_H = self.H + 2 * self.pad_y
+        padded_W = self.W + 2 * self.pad_x
+        padded_ideal = cv2.copyMakeBorder(
+            ideal_perceived_image,
+            self.pad_y, self.pad_y, self.pad_x, self.pad_x,
+            cv2.BORDER_REPLICATE # Replicate edges to avoid introducing new colors
         )
+
+        # 3. Apply the fixed misalignment warp to the PADDED image
+        #    Use the original M_misalign (calculated with original center)
+        #    Output size is the padded size
+        warped_padded = cv2.warpAffine(
+            padded_ideal, self.M_misalign, (padded_W, padded_H),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0) # Keep original border mode
+            # Using BORDER_REPLICATE here might be alternative if black edges persist
+        )
+
+        # 4. Crop the center (original HxW) region from the warped padded image
+        center_y, center_x = padded_H // 2, padded_W // 2
+        start_y = self.pad_y # Equivalent to center_y - self.H // 2 if H is even
+        start_x = self.pad_x # Equivalent to center_x - self.W // 2 if W is even
+        end_y = start_y + self.H
+        end_x = start_x + self.W
+
+        cropped_warped = warped_padded[start_y:end_y, start_x:end_x]
+
+        return cropped_warped
 
 # -------------------------------------------------------------------------
 # Removed optimize_warp_step function

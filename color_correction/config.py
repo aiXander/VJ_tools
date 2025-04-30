@@ -10,8 +10,8 @@ INITIAL_BEAMER_OUT_VALUE = 0.25  # initial RGB value 0‑1
 AMBIENT_LIGHT_STRENGTH   = 0.2   # scalar added to each channel
 
 # Simulation Parameters --------------------------------------------------
-MAX_ROTATION = 10.0    # degrees
-MAX_SHIFT    = 0.1   # fraction of image width/height
+MAX_ROTATION = 0.001    # degrees
+MAX_SHIFT    = 0.001   # fraction of image width/height
 
 # Optimiser ---------------------------------------------------------------
 BEAMER_LEARNING_RATE = 0.05

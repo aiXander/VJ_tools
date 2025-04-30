@@ -2,6 +2,7 @@ import time
 import cv2
 import numpy as np
 import random
+import cma
 
 # Import constants and components from separate files
 from config import *
@@ -22,7 +23,9 @@ class SpatialWarp:
         return np.array([self.theta, self.tx, self.ty], dtype=np.float32)
 
     def update(self, params):
-        self.theta, self.tx, self.ty = params[0], params[1], params[2]
+        # Ensure params are correctly typed before assignment if needed
+        self.theta, self.tx, self.ty = float(params[0]), float(params[1]), float(params[2])
+
 
     def get_matrix(self, center_xy):
         """Calculates the 2x3 affine warp matrix."""
@@ -35,9 +38,9 @@ class SpatialWarp:
     @staticmethod
     def get_matrix_from_params(theta, tx, ty, center_xy):
         """Static method to get matrix from explicit parameters."""
-        rot_mat = cv2.getRotationMatrix2D(center_xy, theta, 1.0)
-        rot_mat[0, 2] += tx
-        rot_mat[1, 2] += ty
+        rot_mat = cv2.getRotationMatrix2D(center_xy, float(theta), 1.0) # Ensure theta is float
+        rot_mat[0, 2] += float(tx) # Ensure tx is float
+        rot_mat[1, 2] += float(ty) # Ensure ty is float
         return rot_mat
 
 # -------------------------------------------------------------------------
@@ -70,52 +73,7 @@ class SimulatedCamera:
         )
 
 # -------------------------------------------------------------------------
-# New Function: Optimize Warp Step ----------------------------------------
-def optimize_warp_step(spatial_warp, warp_opt, lossfn, corrected_perceived, misaligned_perceived, img_center, current_warp_params):
-    """Calculates warp gradients and performs one optimization step."""
-    H, W, _ = corrected_perceived.shape
-    grad_corrected_perceived = lossfn.compute_rgb_gradient_wrt_input(corrected_perceived)
-
-    # Calculate spatial gradients of misaligned_perceived
-    misaligned_f64 = misaligned_perceived.astype(np.float64)
-    grad_misaligned_x = cv2.Sobel(misaligned_f64, cv2.CV_64F, 1, 0, ksize=3).astype(np.float32)
-    grad_misaligned_y = cv2.Sobel(misaligned_f64, cv2.CV_64F, 0, 1, ksize=3).astype(np.float32)
-
-    # Get warp parameters and calculate Jacobian components
-    theta_rad = np.radians(current_warp_params[0])
-    cos_t, sin_t = np.cos(theta_rad), np.sin(theta_rad)
-    cx, cy = img_center
-    u_coords, v_coords = np.meshgrid(np.arange(W), np.arange(H))
-
-    dx_dTheta_x = -(u_coords - cx) * sin_t - (v_coords - cy) * cos_t
-    dx_dTheta_y =  (u_coords - cx) * cos_t - (v_coords - cy) * sin_t
-
-    # Chain rule calculation
-    dL_dCorrected_sum = np.sum(grad_corrected_perceived, axis=2)
-    grad_misaligned_x_sum = np.sum(grad_misaligned_x, axis=2)
-    grad_misaligned_y_sum = np.sum(grad_misaligned_y, axis=2)
-
-    warp_grad = np.zeros(3, dtype=np.float32)
-
-    # Gradient w.r.t tx
-    grad_tx_map = dL_dCorrected_sum * grad_misaligned_x_sum
-    warp_grad[1] = np.mean(grad_tx_map)
-
-    # Gradient w.r.t ty
-    grad_ty_map = dL_dCorrected_sum * grad_misaligned_y_sum
-    warp_grad[2] = np.mean(grad_ty_map)
-
-    # Gradient w.r.t theta
-    grad_theta_map = dL_dCorrected_sum * (grad_misaligned_x_sum * dx_dTheta_x + grad_misaligned_y_sum * dx_dTheta_y)
-    dL_dTheta_rad = np.mean(grad_theta_map)
-    warp_grad[0] = dL_dTheta_rad * (np.pi / 180.0) # Convert to degree gradient
-
-    # Update Warp parameters
-    updated_params = warp_opt.step(warp_grad, current_warp_params)
-    spatial_warp.update(updated_params)
-
-    return warp_grad # Return the calculated gradient for logging
-
+# Removed optimize_warp_step function
 # -------------------------------------------------------------------------
 
 def main(surface_path, target_path):
@@ -133,8 +91,30 @@ def main(surface_path, target_path):
 
     lossfn = Loss(target_bgr_f32)
     color_opt = AdamOptimiser(BEAMER_LEARNING_RATE, (H, W, 3))
-    warp_opt   = AdamOptimiser(WARP_LEARNING_RATE, (3,)) # Optimizer for theta, tx, ty
+    # Warp optimizer removed, will use CMA-ES in Phase 1
     spatial_warp = SpatialWarp() # Holds the optimizable warp parameters
+
+    # --- CMA-ES for Warp Optimization Setup ---
+    initial_warp_params = spatial_warp.get_params() # Should be [0, 0, 0] initially
+    # Heuristic initial std deviations based on config limits
+    initial_sigma_theta = MAX_ROTATION / 2.0
+    initial_sigma_tx = MAX_SHIFT * W / 2.0
+    initial_sigma_ty = MAX_SHIFT * H / 2.0
+    # Use a single sigma value, CMA-ES adapts per-parameter variances internally
+    initial_sigma0 = np.mean([initial_sigma_theta, initial_sigma_tx, initial_sigma_ty]) * 0.5 # Start with moderate overall variance
+    CMAES_POPULATION_SIZE = 25 # Define population size
+    # Define bounds loosely based on config, can be tuned
+    warp_bounds = [
+        [-MAX_ROTATION * 1.5, -MAX_SHIFT * W * 0.8, -MAX_SHIFT * H * 0.8], # Lower bounds [theta, tx, ty]
+        [ MAX_ROTATION * 1.5,  MAX_SHIFT * W * 0.8,  MAX_SHIFT * H * 0.8]  # Upper bounds [theta, tx, ty]
+    ]
+    cma_options = {
+        'popsize': CMAES_POPULATION_SIZE,
+        'bounds': warp_bounds,
+        'verbose': -9 # Suppress CMA-ES internal print statements
+    }
+    es = cma.CMAEvolutionStrategy(initial_warp_params.tolist(), initial_sigma0, cma_options)
+    # ---
 
     # --- Optimization Phase Control ---
     current_phase = 1 # Start with phase 1 (Alignment)
@@ -147,93 +127,132 @@ def main(surface_path, target_path):
     writer = None
     last_corrected_perceived = None # Store the final corrected frame
 
+    # Init loss variables outside loop
+    loss, rgb_L, ssim_L = 0.0, 0.0, 0.0
+    grad_bmr = np.zeros_like(beamer.get()) # Init grad_bmr
+
     while True:
         total_steps += 1
         t_start_iter = time.time()
 
-        # --- Phase-Dependent Setup ---
+        # --- Phase-Dependent Setup & Forward/Backward Pass ---
         if current_phase == 1:
-            # Phase 1: Align geometry. Use TARGET as fixed beamer output.
-            current_beamer_map = target_bgr_f32 # Fixed
-            current_warp_params = spatial_warp.get_params() # Optimizable
-            M_corrective = spatial_warp.get_matrix(img_center) # Optimizable
-        else: # current_phase == 2
-            # Phase 2: Correct color. Use optimizable beamer output, fixed warp.
-            current_beamer_map = beamer.get() # Optimizable
-            if final_M_corrective is None:
-                # Should not happen if phase transition logic is correct
-                print("ERROR: final_M_corrective is None in Phase 2!")
-                final_M_corrective = spatial_warp.get_matrix(img_center) # Fallback
-            M_corrective = final_M_corrective # Fixed
-            current_warp_params = spatial_warp.get_params() # Fixed (though read for info)
+            # Phase 1: Align geometry using CMA-ES. Use TARGET as fixed beamer output.
+            current_beamer_map = target_bgr_f32 # Fixed beamer map for phase 1 evaluations
 
-        # --- Forward Pass ---
-        # 1. Simulate camera capture (includes projection and misalignment)
-        misaligned_perceived = camera.capture(current_beamer_map) # Takes beamer map
+            # Simulate camera capture ONCE per iteration (fixed beamer map, fixed camera misalignment)
+            misaligned_perceived = camera.capture(current_beamer_map) # Fixed for Phase 1 evaluations
 
-        # 2. Apply corrective warp (Optimizable in P1, Fixed in P2)
-        corrected_perceived = cv2.warpAffine(misaligned_perceived, M_corrective, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE) # Use replicate border for correction
+            # --- CMA-ES Optimization Step ---
+            if not es.stop():
+                solutions = es.ask() # Get population of warp parameter candidates [theta, tx, ty]
+                losses = []
 
-        # --- Compute Loss ---
-        loss, rgb_L, ssim_L = lossfn.compute_loss_components(corrected_perceived)
+                for params in solutions:
+                    # params = [theta, tx, ty]
+                    M_corrective_candidate = SpatialWarp.get_matrix_from_params(params[0], params[1], params[2], img_center)
+                    # Apply candidate warp
+                    corrected_candidate = cv2.warpAffine(
+                        misaligned_perceived, M_corrective_candidate, (W, H), # Use the fixed misaligned image
+                        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+                    )
+                    # Compute loss for this candidate
+                    loss_candidate, _, _ = lossfn.compute_loss_components(corrected_candidate)
+                    losses.append(loss_candidate)
 
-        # --- Compute Gradients & Update (Phase Dependent) ---
-        grad_bmr = np.zeros_like(current_beamer_map)
-        warp_grad = np.zeros(3, dtype=np.float32)
+                es.tell(solutions, losses) # Update CMA-ES state
 
-        if current_phase == 1:
-            # Phase 1: Optimize Warp Only
-            warp_grad = optimize_warp_step(
-                spatial_warp, warp_opt, lossfn, corrected_perceived,
-                misaligned_perceived, img_center, current_warp_params
-            )
+                # Update spatial_warp with the current mean estimate from CMA-ES
+                current_warp_params = es.mean
+                spatial_warp.update(current_warp_params)
+
+                # Get the corrective matrix based on the updated MEAN parameters for consistent state/visualization
+                M_corrective = spatial_warp.get_matrix(img_center)
+                # Calculate the corrected image using the MEAN parameters for loss logging and visualization for this iteration
+                corrected_perceived = cv2.warpAffine(misaligned_perceived, M_corrective, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                # Update loss components based on the mean parameters' result for consistent logging
+                loss, rgb_L, ssim_L = lossfn.compute_loss_components(corrected_perceived)
+                # loss variable here now reflects the loss for the *mean* parameters, not necessarily the minimum loss found in the population
 
             # Phase Transition Check
             phase1_step += 1
-            if phase1_step >= PHASE1_ITERATIONS:
+            # Stop if max iterations reached OR CMA-ES converges/stalls
+            if phase1_step >= PHASE1_ITERATIONS or es.stop():
+                # Final update using the absolute best parameters found by CMA-ES
+                best_params_final = es.result.xbest
+                spatial_warp.update(best_params_final)
                 print(f"\n--- Phase 1 Complete ({phase1_step} iterations) ---")
-                print(f"Final Warp: θ={spatial_warp.theta:.2f}, tx={spatial_warp.tx:.1f}, ty={spatial_warp.ty:.1f}")
-                final_M_corrective = spatial_warp.get_matrix(img_center) # Store final warp
+                stop_reason = es.stop()
+                print(f"CMA-ES Stop Reason: {stop_reason}")
+                print(f"Final Warp (Best): θ={spatial_warp.theta:.2f}, tx={spatial_warp.tx:.1f}, ty={spatial_warp.ty:.1f}")
+
+                final_M_corrective = spatial_warp.get_matrix(img_center) # Store final warp from best params
                 current_phase = 2
-                # Reset beamer map to initial value and reset its optimizer
+                # Reset beamer map to initial value and reset its optimizer for Phase 2
                 beamer.reset()
                 color_opt.reset()
                 print("--- Starting Phase 2: Color Optimization ---\n")
+                # Skip rest of loop for this iteration after transition
+                continue
 
 
         else: # current_phase == 2
-            # Phase 2: Optimize Beamer Only
+            # Phase 2: Correct color. Use optimizable beamer output, fixed warp.
+            current_beamer_map = beamer.get() # Optimizable beamer map
+            M_corrective = final_M_corrective # Fixed warp matrix from Phase 1
+
+            # --- Forward Pass for Phase 2 ---
+            # 1. Simulate camera capture (includes projection and misalignment) - MUST be recalculated with current beamer map
+            misaligned_perceived = camera.capture(current_beamer_map)
+
+            # 2. Apply FIXED corrective warp
+            corrected_perceived = cv2.warpAffine(misaligned_perceived, M_corrective, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+            # --- Compute Loss ---
+            loss, rgb_L, ssim_L = lossfn.compute_loss_components(corrected_perceived)
+
+            # --- Compute Gradients & Update Beamer ---
             grad_corrected_perceived = lossfn.compute_rgb_gradient_wrt_input(corrected_perceived)
-
-            # Approximation: Ignore warp Jacobians for beamer gradient path
-            # dL/dBeamer ~ dL/dCorrected * surf
             beamer_clip_mask = (current_beamer_map > 0.0) & (current_beamer_map < 1.0)
-            grad_bmr = (grad_corrected_perceived * surf * beamer_clip_mask).astype(np.float32)
-
-            # Update Beamer
+            grad_bmr = (grad_corrected_perceived * surf * beamer_clip_mask).astype(np.float32) # Calculate beamer gradient
+            # Update Beamer parameters
             beamer.update(color_opt.step(grad_bmr, current_beamer_map))
 
-        last_corrected_perceived = corrected_perceived # Store for final image
+            # Read current warp parameters (fixed) only for logging consistency
+            current_warp_params = spatial_warp.get_params()
 
-        # Print info
+
+        # --- Store final corrected frame ---
+        last_corrected_perceived = corrected_perceived
+
+        # --- Logging ---
         phase_str = f"P{current_phase}"
-        step_str = f"Step {total_steps}" if current_phase == 2 else f"Step {phase1_step}/{PHASE1_ITERATIONS}"
+        step_in_phase_str = f"{phase1_step}/{PHASE1_ITERATIONS}" if current_phase == 1 else f"{total_steps - PHASE1_ITERATIONS}"
+        step_str = f"Step {total_steps} ({step_in_phase_str})"
         loss_str = f"{phase_str} {step_str}: L={loss:.4f}"
         if RGB_LOSS_W > 0: loss_str += f" RGB={rgb_L:.4f}"
         if SSIM_LOSS_W > 0: loss_str += f" SSIM={ssim_L:.4f}"
+        # Read warp params directly from spatial_warp object which is updated correctly in each phase
         warp_str = f"Warp: θ={spatial_warp.theta:.2f}, tx={spatial_warp.tx:.1f}, ty={spatial_warp.ty:.1f}"
-        # Show relevant gradient based on phase
-        if current_phase == 1:
-            grad_str = f"G_Warp=[{warp_grad[0]:.2e}, {warp_grad[1]:.2e}, {warp_grad[2]:.2e}]"
-        else:
-            grad_str = f"G_Bmr={np.mean(np.abs(grad_bmr)):.2e}"
 
-        print(f"{loss_str} | {warp_str} | {grad_str}")
+        # Show relevant info based on phase
+        if current_phase == 1:
+             # Log CMA-ES standard deviations
+             if hasattr(es.result, 'stds') and es.result.stds is not None:
+                 std_devs = es.result.stds
+                 info_str = f"Warp σ=[{std_devs[0]:.1e}, {std_devs[1]:.1e}, {std_devs[2]:.1e}]"
+             else: # Handle initial state or if stds aren't available
+                 info_str = f"Warp σ=(init)" # Indicate initial state
+        else: # Phase 2
+             grad_bmr_mean_abs = np.mean(np.abs(grad_bmr))
+             info_str = f"|∇Beamer|={grad_bmr_mean_abs:.2e}"
+
+        print(f"{loss_str} | {warp_str} | {info_str}")
 
 
         # --- Visualization ---
         vis_surf = (surf * 255).astype(np.uint8)
-        # Display the beamer map being USED in the current phase
+        # Display the beamer map being USED in the current phase/iteration
         vis_beamer = (current_beamer_map * 255).astype(np.uint8)
         vis_misaligned = (np.clip(misaligned_perceived, 0, 1) * 255).astype(np.uint8)
         vis_corrected = (np.clip(corrected_perceived, 0, 1) * 255).astype(np.uint8)
@@ -244,7 +263,7 @@ def main(surface_path, target_path):
 
         vis = composite_frame([
             vis_surf, vis_beamer, vis_misaligned, vis_corrected, vis_target
-        ], ["Surface", beamer_label, "Misaligned", "Corrected", "Target"])
+        ], ["Surface", beamer_label, "Misaligned", "Corrected (Mean Warp P1)", "Target"]) # Updated label
         cv2.imshow(WINDOW_NAME, vis)
 
         if writer is None:
@@ -278,23 +297,44 @@ def main(surface_path, target_path):
         # Convert float [0,1] images to uint8 [0,255] for saving
         vis_final_beamer = (final_beamer_map * 255).astype(np.uint8)
         vis_default_misaligned = (np.clip(default_misaligned_perceived, 0, 1) * 255).astype(np.uint8)
-        vis_last_corrected = (np.clip(last_corrected_perceived, 0, 1) * 255).astype(np.uint8)
+        vis_last_corrected = (np.clip(last_corrected_perceived, 0, 1) * 255).astype(np.uint8) # This uses the result from the *last* iteration (potentially mean params if P1 ended)
         vis_target = (target_bgr_f32 * 255).astype(np.uint8)
+
+        # Regenerate corrected view using the *final best* warp params for accurate comparison
+        if final_M_corrective is not None:
+             # Use the misaligned view corresponding to the *final* beamer map if available, else use default
+             final_beamer_misaligned = camera.capture(final_beamer_map) # What the camera sees with the final beamer output
+             vis_optimized_corrected_final = (np.clip(cv2.warpAffine(final_beamer_misaligned, final_M_corrective, (W,H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE), 0, 1)*255).astype(np.uint8)
+        else:
+             # Fallback if phase 1 didn't finish or something went wrong
+             vis_optimized_corrected_final = vis_last_corrected
+
 
         comparison_img = composite_frame([
             vis_final_beamer,
             vis_default_misaligned,
-            vis_last_corrected,
+            vis_optimized_corrected_final, # Show corrected view using final best warp
             vis_target
         ], [
             "Final Beamer",
-            "Default (Misaligned)", # Show what happens if you just project target with misalignment
-            "Optimized (Corrected)",
+            "Default View (Misaligned)", # Show what happens if you just project target with misalignment
+            "Optimized View (Corrected)",
             "Target"
         ])
 
-        cv2.imwrite(config.COMPARISON_FILENAME, comparison_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        print(f"Saved final comparison image to {config.COMPARISON_FILENAME}")
+        # Ensure config module is accessible or COMPARISON_FILENAME is defined directly
+        try:
+            comparison_filename = config.COMPARISON_FILENAME
+        except AttributeError:
+            comparison_filename = "comparison_result.jpg" # Fallback filename
+            print(f"Warning: config.COMPARISON_FILENAME not found, using default: {comparison_filename}")
+
+        cv2.imwrite(comparison_filename, comparison_img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        print(f"Saved final comparison image to {comparison_filename}")
+
 
 if __name__ == "__main__":
+    # Ensure config is imported if COMPARISON_FILENAME is used from it in the save block
+    import config # Make sure config is imported here if needed later
+
     main('../assets/surface.jpg', '../assets/target.jpg')

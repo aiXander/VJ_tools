@@ -2,47 +2,15 @@ import time
 import cv2
 import numpy as np
 import random
-import cma
 import math
 
-# Import constants and components from separate files
 from config import *
 from components import (
     InputSurface, BeamerOutLayer, AdamOptimiser,
     ProjectionSimulator, Loss, composite_frame
 )
-
-# -------------------------------------------------------------------------
-class SpatialWarp:
-    """Stores and manages optimizable affine warp parameters."""
-    def __init__(self):
-        self.theta = 0.0 # degrees
-        self.tx = 0.0    # pixels
-        self.ty = 0.0    # pixels
-
-    def get_params(self):
-        return np.array([self.theta, self.tx, self.ty], dtype=np.float32)
-
-    def update(self, params):
-        # Ensure params are correctly typed before assignment if needed
-        self.theta, self.tx, self.ty = float(params[0]), float(params[1]), float(params[2])
-
-
-    def get_matrix(self, center_xy):
-        """Calculates the 2x3 affine warp matrix."""
-        rot_mat = cv2.getRotationMatrix2D(center_xy, self.theta, 1.0)
-        # Combine rotation and translation
-        rot_mat[0, 2] += self.tx
-        rot_mat[1, 2] += self.ty
-        return rot_mat
-
-    @staticmethod
-    def get_matrix_from_params(theta, tx, ty, center_xy):
-        """Static method to get matrix from explicit parameters."""
-        rot_mat = cv2.getRotationMatrix2D(center_xy, float(theta), 1.0) # Ensure theta is float
-        rot_mat[0, 2] += float(tx) # Ensure tx is float
-        rot_mat[1, 2] += float(ty) # Ensure ty is float
-        return rot_mat
+from cmaes import MultiStartCMAESOptimizer, CMAESOptimizer
+from spatial_warp import SpatialWarp # Import from the new file
 
 # -------------------------------------------------------------------------
 # New Class: SimulatedCamera ----------------------------------------------
@@ -134,40 +102,19 @@ def main(surface_path, target):
     # Warp optimizer removed, will use CMA-ES in Phase 1
     spatial_warp = SpatialWarp() # Holds the optimizable warp parameters
 
-    # --- CMA-ES for Warp Optimization Setup ---
-    initial_warp_params = spatial_warp.get_params() # Should be [0, 0, 0] initially
-
-    # Define scaling factors based on typical ranges/limits
-    scale_factors = np.array([MAX_ROTATION, MAX_SHIFT * W, MAX_SHIFT * H], dtype=np.float32)
-    # Avoid division by zero if a scale factor is zero
-    scale_factors[scale_factors == 0] = 1.0
-
-    # Scaled initial guess (0 scaled is still 0)
-    initial_warp_params_scaled = initial_warp_params / scale_factors
-
-    # Use a single sigma0=1.0 in the scaled space as recommended
-    initial_sigma0 = 1.0 # CMA-ES adapts variances internally
-    CMAES_POPULATION_SIZE = 50 # Increase population size
-
-    # Define bounds in the original space first
-    warp_bounds_orig = [
-        [-MAX_ROTATION * 1.5, -MAX_SHIFT * W * 0.8, -MAX_SHIFT * H * 0.8], # Lower bounds [theta, tx, ty]
-        [ MAX_ROTATION * 1.5,  MAX_SHIFT * W * 0.8,  MAX_SHIFT * H * 0.8]  # Upper bounds [theta, tx, ty]
-    ]
-    # Scale the bounds
-    warp_bounds_scaled = [
-        (np.array(warp_bounds_orig[0]) / scale_factors).tolist(),
-        (np.array(warp_bounds_orig[1]) / scale_factors).tolist()
-    ]
-
-    cma_options = {
-        'popsize': CMAES_POPULATION_SIZE,
-        'bounds': warp_bounds_scaled, # Use scaled bounds
-        'verbose': -9 # Suppress CMA-ES internal print statements
-    }
-    # Initialize CMA-ES with scaled parameters and sigma=1.0
-    es = cma.CMAEvolutionStrategy(initial_warp_params_scaled.tolist(), initial_sigma0, cma_options)
-    # ---
+    # --- Setup Multi-Start CMA-ES Optimizer ---
+    CMAES_POPULATION_SIZE = 30 # Reduced for faster iterations while maintaining diversity
+    cma_optimizer = MultiStartCMAESOptimizer(
+        initial_params=spatial_warp.get_params(), # Start at [0, 0, 0]
+        W=W, H=H, img_center=img_center,
+        max_rotation=MAX_ROTATION,
+        max_shift=MAX_SHIFT,
+        population_size=CMAES_POPULATION_SIZE,
+        verbose=0, # Show restart information
+        max_restarts=3, # Reduced restarts for speed while keeping escape capability
+        min_improvement_threshold=0.001 # Slightly higher threshold for faster convergence
+    )
+    # --- End CMA-ES Setup ---
 
     # --- Optimization Phase Control ---
     current_phase = 1 # Start with phase 1 (Alignment)
@@ -196,55 +143,40 @@ def main(surface_path, target):
             # Simulate camera capture ONCE per iteration (fixed beamer map, fixed camera misalignment)
             misaligned_perceived = camera.capture(current_beamer_map) # Fixed for Phase 1 evaluations
 
-            # --- CMA-ES Optimization Step ---
-            if not es.stop():
-                solutions_scaled = es.ask() # Get population of SCALED warp parameter candidates
-                losses = []
+            # --- CMA-ES Optimization Step using the optimizer class ---
+            if not cma_optimizer.should_stop():
+                # Ask for new solutions (scaled)
+                solutions_scaled = cma_optimizer.ask()
+                # Evaluate them and tell CMA-ES the results
+                cma_optimizer.evaluate_and_tell(misaligned_perceived, lossfn)
 
-                for params_scaled in solutions_scaled:
-                    # Unscale parameters before using them
-                    params_unscaled = np.array(params_scaled) * scale_factors
-                    # params_unscaled = [theta, tx, ty]
-                    M_corrective_candidate = SpatialWarp.get_matrix_from_params(
-                        params_unscaled[0], params_unscaled[1], params_unscaled[2], img_center
-                    )
-                    # Apply candidate warp
-                    corrected_candidate = cv2.warpAffine(
-                        misaligned_perceived, M_corrective_candidate, (W, H), # Use the fixed misaligned image
-                        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-                    )
-                    # Compute loss for this candidate
-                    loss_candidate, _, _ = lossfn.compute_loss_components(corrected_candidate)
-                    losses.append(loss_candidate)
-
-                es.tell(solutions_scaled, losses) # Update CMA-ES state with SCALED solutions
-
-                # Get the current mean estimate (scaled) from CMA-ES
-                current_warp_params_scaled = es.mean
-                # Unscale the mean parameters for updating spatial_warp and consistent visualization/logging
-                current_warp_params_unscaled = current_warp_params_scaled * scale_factors
+                # Update spatial_warp with the current *mean* parameters (unscaled) for logging/visualization
+                current_warp_params_unscaled = cma_optimizer.get_mean_unscaled_params()
                 spatial_warp.update(current_warp_params_unscaled)
 
                 # Get the corrective matrix based on the updated unscaled MEAN parameters
                 M_corrective = spatial_warp.get_matrix(img_center)
                 # Calculate the corrected image using the MEAN parameters for loss logging and visualization
                 corrected_perceived = cv2.warpAffine(misaligned_perceived, M_corrective, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-                # Update loss components based on the mean parameters' result for consistent logging
-                loss, rgb_L, ssim_L = lossfn.compute_loss_components(corrected_perceived)
+                # Update loss components based on the mean parameters' result for consistent logging (use blur for Phase 1)
+                loss, rgb_L, ssim_L = lossfn.compute_loss_components(corrected_perceived, use_blur=True)
                 # loss variable here now reflects the loss for the *mean* parameters
 
             # Phase Transition Check
             phase1_step += 1
             # Stop if max iterations reached OR CMA-ES converges/stalls
-            if phase1_step >= PHASE1_ITERATIONS or es.stop():
-                # Final update using the absolute best parameters (scaled) found by CMA-ES
-                best_params_scaled_final = es.result.xbest
-                # Unscale the final best parameters
-                best_params_unscaled_final = best_params_scaled_final * scale_factors
+            if phase1_step >= PHASE1_ITERATIONS or cma_optimizer.should_stop():
+                # Final update using the absolute best parameters found by CMA-ES (unscaled)
+                best_params_unscaled_final = cma_optimizer.get_best_unscaled_params()
                 spatial_warp.update(best_params_unscaled_final) # Update with unscaled best params
                 print(f"\n--- Phase 1 Complete ({phase1_step} iterations) ---")
-                stop_reason = es.stop()
-                print(f"CMA-ES Stop Reason: {stop_reason}")
+                stop_reason = cma_optimizer.get_stop_reason() # Get the dictionary of stop criteria
+                print(f"Multi-Start CMA-ES Results:")
+                print(f"  Final restart: {stop_reason['restart_count']}/{cma_optimizer.max_restarts}")
+                print(f"  Best overall loss: {stop_reason['best_overall_loss']:.6f}")
+                print(f"  Stagnation counter: {stop_reason['stagnation_counter']}")
+                if stop_reason['restart_history']:
+                    print(f"  Restart history: {len(stop_reason['restart_history'])} restarts performed")
                 # Print the unscaled parameters from the spatial_warp object
                 print(f"Final Warp (Best): θ={spatial_warp.theta:.2f}, tx={spatial_warp.tx:.1f}, ty={spatial_warp.ty:.1f}")
 
@@ -300,8 +232,8 @@ def main(surface_path, target):
         # Show relevant info based on phase
         if current_phase == 1:
              # Log CMA-ES standard deviations (these are in the SCALED space)
-             if hasattr(es.result, 'stds') and es.result.stds is not None:
-                 std_devs_scaled = es.result.stds
+             std_devs_scaled = cma_optimizer.get_scaled_stds()
+             if std_devs_scaled is not None:
                  # Display scaled std deviations for insight into optimizer state
                  info_str = f"Warp σ (scaled)=[{std_devs_scaled[0]:.1e}, {std_devs_scaled[1]:.1e}, {std_devs_scaled[2]:.1e}]"
              else: # Handle initial state or if stds aren't available
@@ -326,7 +258,7 @@ def main(surface_path, target):
 
         vis = composite_frame([
             vis_surf, vis_beamer, vis_misaligned, vis_corrected, vis_target
-        ], ["Surface", beamer_label, "Misaligned", "Corrected (Mean Warp P1)", "Target"]) # Updated label
+        ], ["Surface", beamer_label, "Misaligned", "Corrected (P1: Mean / P2: Final)", "Target"]) # Updated label for clarity
         cv2.imshow(WINDOW_NAME, vis)
 
         if writer is None:
@@ -398,7 +330,7 @@ def main(surface_path, target):
 
 if __name__ == "__main__":
     # Ensure config is imported if COMPARISON_FILENAME is used from it in the save block
-    import config # Make sure config is imported here if needed later
+    import config # Keep config import if needed, e.g., for COMPARISON_FILENAME
 
     #main('../assets/surface.jpg', 0.5)
     main('../assets/surface.jpg', '../assets/target.jpg')
